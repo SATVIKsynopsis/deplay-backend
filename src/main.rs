@@ -1,16 +1,20 @@
 use axum::{
-    extract::Json,
+    extract::{Json, Path},
     http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::post,
+    response::{IntoResponse},
+    routing::{post, get},
     Router,
 };
+use axum::response::sse::{Event, Sse};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    path::Path,
-    process::Command,
+    path::Path as FsPath,
+    process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
+    io::{BufRead, BufReader},
+    convert::Infallible,
+    time::Duration,
 };
 
 #[derive(Deserialize)]
@@ -19,160 +23,136 @@ struct RunRequest {
     repo_url: String,
 }
 
-#[derive(Serialize)]
-struct AnalysisResponse {
-    summary: String,
-    suggestions: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct RunResponse {
-    status: String,
-    logs: String,
-    analysis: AnalysisResponse,
-}
-
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
-}
-
 #[tokio::main]
 async fn main() {
-    let app = Router::new().route("/run", post(run_repo));
+    let app = Router::new()
+        .route("/run", post(run_repo))
+        .route("/logs/:id", get(stream_logs));
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3001").await.unwrap();
-    println!("Server listening on 3001");
+let port = std::env::var("PORT").unwrap_or("3001".to_string());
+let addr = format!("0.0.0.0:{}", port);
+
+let listener = tokio::net::TcpListener::bind(addr)
+    .await
+    .unwrap();println!("Server listening on port {}", port);
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn run_repo(Json(payload): Json<RunRequest>) -> Response {
+async fn run_repo(Json(payload): Json<RunRequest>) -> impl IntoResponse {
     if !payload.repo_url.starts_with("https://github.com/") {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "repoUrl must start with https://github.com/".to_string(),
-            }),
-        )
-            .into_response();
+            Json(serde_json::json!({ "error": "Only GitHub repos supported" })),
+        );
     }
 
-    let public_check = Command::new("git")
-        .arg("ls-remote")
-        .arg(&payload.repo_url)
-        .output()
-        .unwrap();
+    let run_id = current_timestamp_millis().to_string();
+    let run_id_clone = run_id.clone();
+    let repo_url = payload.repo_url.clone();
 
-    if !public_check.status.success() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "Only public repositories are supported".to_string(),
-            }),
-        )
-            .into_response();
-    }
+    std::thread::spawn(move || {
+        run_job(run_id.clone(), repo_url);
+    });
 
-    let timestamp = current_timestamp_millis();
-    let clone_root = format!("/tmp/repos/{}", timestamp);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "runId": run_id_clone })),
+    )
+}
+
+fn run_job(run_id: String, repo_url: String) {
+    let log_path = format!("/tmp/deplik-{}.log", run_id);
+    let clone_root = format!("/tmp/repos/{}", run_id);
     let repo_dir = format!("{}/repo", clone_root);
 
+    let mut log = |msg: &str| {
+        let _ = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                writeln!(f, "{msg}")
+            });
+    };
+
+    log("Cloning repository...");
     fs::create_dir_all(&clone_root).unwrap();
 
-    let clone_output = Command::new("git")
-        .arg("clone")
-        .arg(&payload.repo_url)
-        .arg(&repo_dir)
-        .output()
-        .unwrap();
+    let clone = Command::new("git")
+        .args(["clone", &repo_url, &repo_dir])
+        .output();
 
-    if !clone_output.status.success() {
-        let logs = format!(
-            "git clone failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&clone_output.stdout),
-            String::from_utf8_lossy(&clone_output.stderr)
-        );
-
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: logs,
-            }),
-        )
-            .into_response();
+    if clone.is_err() {
+        log("Git clone failed");
+        return;
     }
 
     ensure_dockerfile_exists(&repo_dir).unwrap();
 
-    let build_output = Command::new("docker")
+    log("Building Docker image...");
+    let mut child = Command::new("docker")
         .current_dir(&repo_dir)
-        .arg("build")
-        .arg("-t")
-        .arg("depliksandbox")
-        .arg(".")
-        .output()
+        .args(["build", "-t", "depliksandbox", "."])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
 
-    let run_output = Command::new("docker")
-        .arg("run")
-        .arg("--rm")
-        .arg("depliksandbox")
-        .output()
-        .unwrap();
+    if let Some(stdout) = child.stdout.take() {
+        for line in BufReader::new(stdout).lines().flatten() {
+            log(&line);
+        }
+    }
 
-    let logs = format!(
-        "=== docker build ===\nstdout:\n{}\nstderr:\n{}\n\n=== docker run ===\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&build_output.stdout),
-        String::from_utf8_lossy(&build_output.stderr),
-        String::from_utf8_lossy(&run_output.stdout),
-        String::from_utf8_lossy(&run_output.stderr)
-    );
+    if let Some(stderr) = child.stderr.take() {
+        for line in BufReader::new(stderr).lines().flatten() {
+            log(&line);
+        }
+    }
 
-    let ai_stub = analyze_logs(logs.clone());
+    let _ = child.wait();
+    log("Docker build finished");
+    let _ = fs::remove_dir_all(&clone_root);
+}
 
-    let response = RunResponse {
-        status: ai_stub.status,
-        logs,
-        analysis: AnalysisResponse {
-            summary: ai_stub.summary,
-            suggestions: ai_stub.suggestions,
-        },
+async fn stream_logs(
+    Path(run_id): Path<String>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let log_path = format!("/tmp/deplik-{}.log", run_id);
+
+    let stream = async_stream::stream! {
+        let mut last_len = 0;
+
+        loop {
+            if let Ok(content) = fs::read_to_string(&log_path) {
+                if content.len() > last_len {
+                    let new = &content[last_len..];
+                    last_len = content.len();
+                    yield Ok(Event::default().data(new.to_string()));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     };
 
-    (StatusCode::OK, Json(response)).into_response()
+    Sse::new(stream)
 }
 
 fn ensure_dockerfile_exists(repo_dir: &str) -> std::io::Result<()> {
-    let dockerfile_path = Path::new(repo_dir).join("Dockerfile");
+    let dockerfile_path = FsPath::new(repo_dir).join("Dockerfile");
 
     if !dockerfile_path.exists() {
-        let default_dockerfile = r#"FROM node:18
+        let dockerfile = r#"FROM node:20
 WORKDIR /app
 COPY . .
 RUN npm install
-CMD [\"npm\", \"start\"]
+CMD ["npm", "start"]
 "#;
-        fs::write(dockerfile_path, default_dockerfile)?;
+        fs::write(dockerfile_path, dockerfile)?;
     }
 
     Ok(())
-}
-
-struct AiStubResult {
-    status: String,
-    summary: String,
-    suggestions: Vec<String>,
-}
-
-fn analyze_logs(_logs: String) -> AiStubResult {
-    AiStubResult {
-        status: "NOT_READY".to_string(),
-        summary: "Application failed due to missing environment variables".to_string(),
-        suggestions: vec![
-            "Add DATABASE_URL environment variable".to_string(),
-            "Ensure correct PORT is exposed".to_string(),
-        ],
-    }
 }
 
 fn current_timestamp_millis() -> u128 {
