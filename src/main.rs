@@ -29,7 +29,7 @@ async fn main() {
         .route("/run", post(run_repo))
         .route("/logs/:id", get(stream_logs));
 
-let port = std::env::var("PORT").unwrap_or("3001".to_string());
+let port = std::env::var("PORT").unwrap_or("8080".to_string());
 let addr = format!("0.0.0.0:{}", port);
 
 let listener = tokio::net::TcpListener::bind(addr)
