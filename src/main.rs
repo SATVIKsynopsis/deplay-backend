@@ -1,20 +1,20 @@
+use axum::response::sse::{Event, Sse};
 use axum::{
     extract::{Json, Path},
     http::StatusCode,
-    response::{IntoResponse},
-    routing::{post, get},
+    response::IntoResponse,
+    routing::{get, post},
     Router,
 };
-use axum::response::sse::{Event, Sse};
 use serde::{Deserialize, Serialize};
 use std::{
+    convert::Infallible,
     fs,
+    io::{BufRead, BufReader},
     path::Path as FsPath,
     process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
-    io::{BufRead, BufReader},
-    convert::Infallible,
     time::Duration,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Deserialize)]
@@ -29,12 +29,11 @@ async fn main() {
         .route("/run", post(run_repo))
         .route("/logs/:id", get(stream_logs));
 
-let port = std::env::var("PORT").unwrap_or("8080".to_string());
-let addr = format!("0.0.0.0:{}", port);
+    let port = std::env::var("PORT").unwrap_or("8080".to_string());
+    let addr = format!("0.0.0.0:{}", port);
 
-let listener = tokio::net::TcpListener::bind(addr)
-    .await
-    .unwrap();println!("Server listening on port {}", port);
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    println!("Server listening on port {}", port);
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -79,12 +78,19 @@ fn run_job(run_id: String, repo_url: String) {
     log("Cloning repository...");
     fs::create_dir_all(&clone_root).unwrap();
 
-    let clone = Command::new("git")
+    let output = Command::new("git")
         .args(["clone", &repo_url, &repo_dir])
-        .output();
+        .output()
+        .expect("failed to execute git");
 
-    if clone.is_err() {
-        log("Git clone failed");
+    log("Git clone stdout:");
+    log(&String::from_utf8_lossy(&output.stdout));
+
+    log("Git clone stderr:");
+    log(&String::from_utf8_lossy(&output.stderr));
+
+    if !output.status.success() {
+        log("Git clone exited with non-zero status");
         return;
     }
 
