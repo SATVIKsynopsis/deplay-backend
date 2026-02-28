@@ -6,6 +6,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use std::{
     convert::Infallible,
@@ -16,18 +17,41 @@ use std::{
     time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
+use tower_http::cors::{Any, CorsLayer};
+
+use crate::analyze::analyze;
+mod analyze;
+use crate::detect_dockerfile::general_dockerfile;
+
+mod detect_dockerfile;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RunRequest {
     repo_url: String,
+    language: String,
+}
+
+#[derive(Serialize)]
+struct Issue {
+    kind: String,
+    message: String,
+    suggestion: String,
 }
 
 #[tokio::main]
 async fn main() {
+    let cors = CorsLayer::new()
+        .allow_origin(["http://localhost:3000".parse().unwrap()])
+        .allow_methods(Any)
+        .allow_headers([CONTENT_TYPE, AUTHORIZATION, ACCEPT])
+        .allow_credentials(false);
+
     let app = Router::new()
         .route("/run", post(run_repo))
-        .route("/logs/:id", get(stream_logs));
+        .route("/logs/:id", get(stream_logs))
+        .route("/analysis/:id", get(get_analysis))
+        .layer(cors);
 
     let port = std::env::var("PORT").unwrap_or("8080".to_string());
     let addr = format!("0.0.0.0:{}", port);
@@ -49,8 +73,10 @@ async fn run_repo(Json(payload): Json<RunRequest>) -> impl IntoResponse {
     let run_id_clone = run_id.clone();
     let repo_url = payload.repo_url.clone();
 
+    let lang = payload.language.clone();
+
     std::thread::spawn(move || {
-        run_job(run_id.clone(), repo_url);
+        run_job(run_id.clone(), repo_url, lang);
     });
 
     (
@@ -59,7 +85,7 @@ async fn run_repo(Json(payload): Json<RunRequest>) -> impl IntoResponse {
     )
 }
 
-fn run_job(run_id: String, repo_url: String) {
+fn run_job(run_id: String, repo_url: String, lang: String) {
     let log_path = format!("/tmp/deplik-{}.log", run_id);
     let clone_root = format!("/tmp/repos/{}", run_id);
     let repo_dir = format!("{}/repo", clone_root);
@@ -94,7 +120,12 @@ fn run_job(run_id: String, repo_url: String) {
         return;
     }
 
-    ensure_dockerfile_exists(&repo_dir).unwrap();
+    log(&format!("Generating Dockerfile for language: {}", lang));
+
+    if let Err(e) = detect_dockerfile::general_dockerfile(&repo_dir, &lang) {
+        log(&format!("Dockerfile generation failed: {e}"));
+        return;
+    }
 
     log("Building Docker image...");
     let mut child = Command::new("docker")
@@ -117,9 +148,36 @@ fn run_job(run_id: String, repo_url: String) {
         }
     }
 
-    let _ = child.wait();
+    let status = child.wait().unwrap();
+
+    if !status.success() {
+        log("Docker build failed");
+        return;
+    }
+
     log("Docker build finished");
-    let _ = fs::remove_dir_all(&clone_root);
+
+    let run_id_clone = run_id.clone();
+
+    std::thread::spawn(move || {
+        let log_path = format!("/tmp/deplik-{}.log", run_id_clone);
+
+        std::thread::sleep(Duration::from_secs(1));
+
+        let logs = fs::read_to_string(&log_path).unwrap_or_default();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        match rt.block_on(analyze(&logs)) {
+            Ok(result) => {
+                let analysis_path = format!("/tmp/deplik-{}.analysis.json", run_id_clone);
+                let json = serde_json::to_string_pretty(&result).unwrap();
+                fs::write(&analysis_path, json).unwrap();
+            }
+            Err(e) => {
+                eprintln!("AI analysis failed: {e}");
+            }
+        }
+    });
 }
 
 async fn stream_logs(
@@ -135,30 +193,42 @@ async fn stream_logs(
                 if content.len() > last_len {
                     let new = &content[last_len..];
                     last_len = content.len();
-                    yield Ok(Event::default().data(new.to_string()));
+
+                    for line in new.lines() {
+    let clean = line.trim_end_matches('\r');
+
+    if !clean.is_empty() {
+        yield Ok(Event::default().data(clean.to_string()));
+    }
+}
                 }
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     };
 
-    Sse::new(stream)
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
 }
 
-fn ensure_dockerfile_exists(repo_dir: &str) -> std::io::Result<()> {
-    let dockerfile_path = FsPath::new(repo_dir).join("Dockerfile");
+async fn get_analysis(Path(run_id): Path<String>) -> impl IntoResponse {
+    let path = format!("/tmp/deplik-{}.analysis.json", run_id);
 
-    if !dockerfile_path.exists() {
-        let dockerfile = r#"FROM node:20
-WORKDIR /app
-COPY . .
-RUN npm install
-CMD ["npm", "start"]
-"#;
-        fs::write(dockerfile_path, dockerfile)?;
+    match fs::read_to_string(path) {
+        Ok(content) => (
+            StatusCode::OK,
+            Json(serde_json::from_str::<serde_json::Value>(&content).unwrap()),
+        ),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "Analysis not ready"
+            })),
+        ),
     }
-
-    Ok(())
 }
 
 fn current_timestamp_millis() -> u128 {
