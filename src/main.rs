@@ -12,17 +12,14 @@ use std::{
     convert::Infallible,
     fs,
     io::{BufRead, BufReader},
-    path::Path as FsPath,
     process::{Command, Stdio},
-    time::Duration,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::analyze::analyze;
 mod analyze;
 use crate::detect_dockerfile::general_dockerfile;
-
 mod detect_dockerfile;
 
 #[derive(Deserialize)]
@@ -70,22 +67,18 @@ async fn run_repo(Json(payload): Json<RunRequest>) -> impl IntoResponse {
     }
 
     let run_id = current_timestamp_millis().to_string();
-    let run_id_clone = run_id.clone();
     let repo_url = payload.repo_url.clone();
-
     let lang = payload.language.clone();
 
-    std::thread::spawn(move || {
-        run_job(run_id.clone(), repo_url, lang);
-    });
+    tokio::spawn(run_job(run_id.clone(), repo_url, lang));
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "runId": run_id_clone })),
+        Json(serde_json::json!({ "runId": run_id })),
     )
 }
 
-fn run_job(run_id: String, repo_url: String, lang: String) {
+async fn run_job(run_id: String, repo_url: String, lang: String) {
     let log_path = format!("/tmp/deplik-{}.log", run_id);
     let clone_root = format!("/tmp/repos/{}", run_id);
     let repo_dir = format!("{}/repo", clone_root);
@@ -102,16 +95,15 @@ fn run_job(run_id: String, repo_url: String, lang: String) {
     };
 
     log("Cloning repository...");
-    fs::create_dir_all(&clone_root).unwrap();
+    let _ = fs::create_dir_all(&clone_root);
 
     let output = Command::new("git")
         .args(["clone", &repo_url, &repo_dir])
         .output()
-        .expect("failed to execute git");
+        .unwrap();
 
     log("Git clone stdout:");
     log(&String::from_utf8_lossy(&output.stdout));
-
     log("Git clone stderr:");
     log(&String::from_utf8_lossy(&output.stderr));
 
@@ -121,8 +113,7 @@ fn run_job(run_id: String, repo_url: String, lang: String) {
     }
 
     log(&format!("Generating Dockerfile for language: {}", lang));
-
-    if let Err(e) = detect_dockerfile::general_dockerfile(&repo_dir, &lang) {
+    if let Err(e) = general_dockerfile(&repo_dir, &lang) {
         log(&format!("Dockerfile generation failed: {e}"));
         return;
     }
@@ -149,7 +140,6 @@ fn run_job(run_id: String, repo_url: String, lang: String) {
     }
 
     let status = child.wait().unwrap();
-
     if !status.success() {
         log("Docker build failed");
         return;
@@ -157,32 +147,29 @@ fn run_job(run_id: String, repo_url: String, lang: String) {
 
     log("Docker build finished");
 
+    let log_path_clone = log_path.clone();
     let run_id_clone = run_id.clone();
 
-    std::thread::spawn(move || {
-        let log_path = format!("/tmp/deplik-{}.log", run_id_clone);
+    tokio::spawn(async move {
+        let logs = fs::read_to_string(&log_path_clone).unwrap_or_default();
 
-        std::thread::sleep(Duration::from_secs(1));
-
-        let logs = fs::read_to_string(&log_path).unwrap_or_default();
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        match rt.block_on(analyze(&logs)) {
+        match analyze(&logs).await {
             Ok(result) => {
-                let analysis_path = format!("/tmp/deplik-{}.analysis.json", run_id_clone);
+                let analysis_path =
+                    format!("/tmp/deplik-{}.analysis.json", run_id_clone);
                 let json = serde_json::to_string_pretty(&result).unwrap();
-                fs::write(&analysis_path, json).unwrap();
+                let _ = fs::write(&analysis_path, json);
             }
-           Err(e) => {
-    let _ = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, "AI analysis failed: {e}")
-        });
-}
+            Err(e) => {
+                let _ = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path_clone)
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        writeln!(f, "AI analysis failed: {e}")
+                    });
+            }
         }
     });
 }
@@ -194,20 +181,17 @@ async fn stream_logs(
 
     let stream = async_stream::stream! {
         let mut last_len = 0;
-
         loop {
             if let Ok(content) = fs::read_to_string(&log_path) {
                 if content.len() > last_len {
                     let new = &content[last_len..];
                     last_len = content.len();
-
                     for line in new.lines() {
-    let clean = line.trim_end_matches('\r');
-
-    if !clean.is_empty() {
-        yield Ok(Event::default().data(clean.to_string()));
-    }
-}
+                        let clean = line.trim_end_matches('\r');
+                        if !clean.is_empty() {
+                            yield Ok(Event::default().data(clean.to_string()));
+                        }
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -231,9 +215,7 @@ async fn get_analysis(Path(run_id): Path<String>) -> impl IntoResponse {
         ),
         Err(_) => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "Analysis not ready"
-            })),
+            Json(serde_json::json!({ "error": "Analysis not ready" })),
         ),
     }
 }
