@@ -173,9 +173,16 @@ fn run_job(run_id: String, repo_url: String, lang: String) {
                 let json = serde_json::to_string_pretty(&result).unwrap();
                 fs::write(&analysis_path, json).unwrap();
             }
-            Err(e) => {
-                eprintln!("AI analysis failed: {e}");
-            }
+           Err(e) => {
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "AI analysis failed: {e}")
+        });
+}
         }
     });
 }
