@@ -7,6 +7,7 @@ use axum::{
     Router,
 };
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use http::Method;
 use serde::{Deserialize, Serialize};
 use std::{
     convert::Infallible,
@@ -19,8 +20,12 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::analyze::analyze;
 mod analyze;
+mod db;
+mod handlers;
 use crate::detect_dockerfile::general_dockerfile;
+use crate::handlers::user_handler;
 mod detect_dockerfile;
+mod github;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,14 +45,19 @@ struct Issue {
 async fn main() {
     let cors = CorsLayer::new()
         .allow_origin(["http://localhost:3000".parse().unwrap()])
-        .allow_methods(Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([CONTENT_TYPE, AUTHORIZATION, ACCEPT])
-        .allow_credentials(false);
+        .allow_credentials(true);
 
     let app = Router::new()
         .route("/run", post(run_repo))
         .route("/logs/:id", get(stream_logs))
         .route("/analysis/:id", get(get_analysis))
+        .route("/auth/github", get(github::github_login))
+        .route("/auth/github/callback", get(github::github_callback))
+        .route("/me", get(user_handler::me))
+        .route("/logout", get(user_handler::logout))
+        .route("/repos", get(user_handler::get_repos))
         .layer(cors);
 
     let port = std::env::var("PORT").unwrap_or("8080".to_string());
@@ -72,10 +82,7 @@ async fn run_repo(Json(payload): Json<RunRequest>) -> impl IntoResponse {
 
     tokio::spawn(run_job(run_id.clone(), repo_url, lang));
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "runId": run_id })),
-    )
+    (StatusCode::OK, Json(serde_json::json!({ "runId": run_id })))
 }
 
 async fn run_job(run_id: String, repo_url: String, lang: String) {
@@ -155,8 +162,7 @@ async fn run_job(run_id: String, repo_url: String, lang: String) {
 
         match analyze(&logs).await {
             Ok(result) => {
-                let analysis_path =
-                    format!("/tmp/deplik-{}.analysis.json", run_id_clone);
+                let analysis_path = format!("/tmp/deplik-{}.analysis.json", run_id_clone);
                 let json = serde_json::to_string_pretty(&result).unwrap();
                 let _ = fs::write(&analysis_path, json);
             }
