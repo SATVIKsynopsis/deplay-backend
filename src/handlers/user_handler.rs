@@ -100,5 +100,5 @@ pub async fn logout(jar: CookieJar) -> impl IntoResponse {
     headers.append(SET_COOKIE, session.to_string().parse().unwrap());
     headers.append(SET_COOKIE, gh_token.to_string().parse().unwrap());
 
-    (headers, Redirect::to("http://localhost:3000")).into_response()
+    (headers, Redirect::to("https://deplay-theta.vercel.app")).into_response()
 }

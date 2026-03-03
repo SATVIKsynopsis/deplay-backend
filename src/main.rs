@@ -6,6 +6,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use http::header::HeaderValue;
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use http::Method;
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,7 @@ struct Issue {
 async fn main() {
     let cors = CorsLayer::new()
         .allow_origin(["http://localhost:3000".parse().unwrap()])
+        .allow_origin("https://deplay-theta.vercel.app".parse::<HeaderValue>().unwrap())
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([CONTENT_TYPE, AUTHORIZATION, ACCEPT])
         .allow_credentials(true);
