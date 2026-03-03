@@ -1,3 +1,5 @@
+use aws_sdk_dynamodb::types::AttributeValue;
+use axum::http::{header::SET_COOKIE, HeaderMap};
 use axum::response::sse::{Event, Sse};
 use axum::{
     extract::{Json, Path},
@@ -6,6 +8,8 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use axum_extra::extract::cookie::Cookie;
+use axum_extra::extract::CookieJar;
 use http::header::HeaderValue;
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use http::Method;
@@ -46,7 +50,11 @@ struct Issue {
 async fn main() {
     let cors = CorsLayer::new()
         .allow_origin(["http://localhost:3000".parse().unwrap()])
-        .allow_origin("https://deplay-theta.vercel.app".parse::<HeaderValue>().unwrap())
+        .allow_origin(
+            "https://deplay-theta.vercel.app"
+                .parse::<HeaderValue>()
+                .unwrap(),
+        )
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([CONTENT_TYPE, AUTHORIZATION, ACCEPT])
         .allow_credentials(true);
@@ -60,6 +68,7 @@ async fn main() {
         .route("/me", get(user_handler::me))
         .route("/logout", get(user_handler::logout))
         .route("/repos", get(user_handler::get_repos))
+        .route("/runs", get(user_handler::get_runs))
         .layer(cors);
 
     let port = std::env::var("PORT").unwrap_or("8080".to_string());
@@ -70,7 +79,7 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn run_repo(Json(payload): Json<RunRequest>) -> impl IntoResponse {
+async fn run_repo(cookies: CookieJar, Json(payload): Json<RunRequest>) -> impl IntoResponse {
     if !payload.repo_url.starts_with("https://github.com/") {
         return (
             StatusCode::BAD_REQUEST,
@@ -78,19 +87,29 @@ async fn run_repo(Json(payload): Json<RunRequest>) -> impl IntoResponse {
         );
     }
 
+    let user_id = match cookies.get("session") {
+        Some(c) => c.value().to_string(),
+        None => "anonymous".to_string(),
+    };
+
     let run_id = current_timestamp_millis().to_string();
     let repo_url = payload.repo_url.clone();
     let lang = payload.language.clone();
 
-    tokio::spawn(run_job(run_id.clone(), repo_url, lang));
+    tokio::spawn(run_job(run_id.clone(), repo_url, lang, user_id));
 
     (StatusCode::OK, Json(serde_json::json!({ "runId": run_id })))
 }
 
-async fn run_job(run_id: String, repo_url: String, lang: String) {
+async fn run_job(run_id: String, repo_url: String, lang: String, user_id: String) {
     let log_path = format!("/tmp/deplik-{}.log", run_id);
     let clone_root = format!("/tmp/repos/{}", run_id);
     let repo_dir = format!("{}/repo", clone_root);
+
+    let repo_name = repo_url
+        .trim_end_matches('/')
+        .trim_start_matches("https://github.com/")
+        .to_string();
 
     let mut log = |msg: &str| {
         let _ = fs::OpenOptions::new()
@@ -103,6 +122,22 @@ async fn run_job(run_id: String, repo_url: String, lang: String) {
             });
     };
 
+    let dynamo = db::dynamo_client().await;
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let _ = dynamo
+        .put_item()
+        .table_name("Deplay")
+        .item("pk", AttributeValue::S(format!("USER#github_{}", user_id)))
+        .item("sk", AttributeValue::S(format!("RUN#{}", run_id)))
+        .item("runId", AttributeValue::S(run_id.clone()))
+        .item("repoUrl", AttributeValue::S(repo_url.clone()))
+        .item("repoName", AttributeValue::S(repo_name.clone()))
+        .item("language", AttributeValue::S(lang.clone()))
+        .item("status", AttributeValue::S("PENDING".to_string()))
+        .item("createdAt", AttributeValue::S(created_at))
+        .send()
+        .await;
+
     log("Cloning repository...");
     let _ = fs::create_dir_all(&clone_root);
 
@@ -111,19 +146,19 @@ async fn run_job(run_id: String, repo_url: String, lang: String) {
         .output()
         .unwrap();
 
-    log("Git clone stdout:");
     log(&String::from_utf8_lossy(&output.stdout));
-    log("Git clone stderr:");
     log(&String::from_utf8_lossy(&output.stderr));
 
     if !output.status.success() {
         log("Git clone exited with non-zero status");
+        update_run_status(&dynamo, &user_id, &run_id, "FAILED").await;
         return;
     }
 
     log(&format!("Generating Dockerfile for language: {}", lang));
     if let Err(e) = general_dockerfile(&repo_dir, &lang) {
         log(&format!("Dockerfile generation failed: {e}"));
+        update_run_status(&dynamo, &user_id, &run_id, "FAILED").await;
         return;
     }
 
@@ -151,6 +186,10 @@ async fn run_job(run_id: String, repo_url: String, lang: String) {
     let status = child.wait().unwrap();
     if !status.success() {
         log("Docker build failed");
+        let logs_content = fs::read_to_string(&log_path).unwrap_or_default();
+        let logs_s3_key = format!("runs/{}/logs.txt", run_id);
+        upload_to_s3(&logs_s3_key, logs_content.into_bytes()).await;
+        update_run_status_with_logs(&dynamo, &user_id, &run_id, "FAILED", &logs_s3_key).await;
         return;
     }
 
@@ -158,28 +197,106 @@ async fn run_job(run_id: String, repo_url: String, lang: String) {
 
     let log_path_clone = log_path.clone();
     let run_id_clone = run_id.clone();
+    let user_id_clone = user_id.clone();
 
     tokio::spawn(async move {
         let logs = fs::read_to_string(&log_path_clone).unwrap_or_default();
+
+        let logs_s3_key = format!("runs/{}/logs.txt", run_id_clone);
+        upload_to_s3(&logs_s3_key, logs.clone().into_bytes()).await;
 
         match analyze(&logs).await {
             Ok(result) => {
                 let analysis_path = format!("/tmp/deplik-{}.analysis.json", run_id_clone);
                 let json = serde_json::to_string_pretty(&result).unwrap();
-                let _ = fs::write(&analysis_path, json);
+                let _ = fs::write(&analysis_path, &json);
+
+                let analysis_s3_key = format!("runs/{}/analysis.json", run_id_clone);
+                upload_to_s3(&analysis_s3_key, json.into_bytes()).await;
+
+                let dynamo = db::dynamo_client().await;
+                let _ = dynamo
+                    .update_item()
+                    .table_name("Deplay")
+                    .key(
+                        "pk",
+                        AttributeValue::S(format!("USER#github_{}", user_id_clone)),
+                    )
+                    .key("sk", AttributeValue::S(format!("RUN#{}", run_id_clone)))
+                    .update_expression("SET #s = :s, logsS3Key = :l, analysisS3Key = :a")
+                    .expression_attribute_names("#s", "status")
+                    .expression_attribute_values(":s", AttributeValue::S("SUCCESS".to_string()))
+                    .expression_attribute_values(
+                        ":l",
+                        AttributeValue::S(format!("runs/{}/logs.txt", run_id_clone)),
+                    )
+                    .expression_attribute_values(
+                        ":a",
+                        AttributeValue::S(format!("runs/{}/analysis.json", run_id_clone)),
+                    )
+                    .send()
+                    .await;
             }
             Err(e) => {
-                let _ = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_path_clone)
-                    .and_then(|mut f| {
-                        use std::io::Write;
-                        writeln!(f, "AI analysis failed: {e}")
-                    });
+                eprintln!("AI analysis failed: {e}");
+                let dynamo = db::dynamo_client().await;
+                update_run_status(&dynamo, &user_id_clone, &run_id_clone, "FAILED").await;
             }
         }
     });
+}
+
+async fn update_run_status(
+    dynamo: &aws_sdk_dynamodb::Client,
+    user_id: &str,
+    run_id: &str,
+    status: &str,
+) {
+    let _ = dynamo
+        .update_item()
+        .table_name("Deplay")
+        .key("pk", AttributeValue::S(format!("USER#github_{}", user_id)))
+        .key("sk", AttributeValue::S(format!("RUN#{}", run_id)))
+        .update_expression("SET #s = :s")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":s", AttributeValue::S(status.to_string()))
+        .send()
+        .await;
+}
+
+async fn update_run_status_with_logs(
+    dynamo: &aws_sdk_dynamodb::Client,
+    user_id: &str,
+    run_id: &str,
+    status: &str,
+    logs_key: &str,
+) {
+    let _ = dynamo
+        .update_item()
+        .table_name("Deplay")
+        .key("pk", AttributeValue::S(format!("USER#github_{}", user_id)))
+        .key("sk", AttributeValue::S(format!("RUN#{}", run_id)))
+        .update_expression("SET #s = :s, logsS3Key = :l")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":s", AttributeValue::S(status.to_string()))
+        .expression_attribute_values(":l", AttributeValue::S(logs_key.to_string()))
+        .send()
+        .await;
+}
+
+async fn upload_to_s3(key: &str, data: Vec<u8>) {
+    let config = aws_config::load_from_env().await;
+    let s3 = aws_sdk_s3::Client::new(&config);
+    if let Err(e) = s3
+        .put_object()
+        .bucket("deplik-runs")
+        .key(key)
+        .body(data.into())
+        .send()
+        .await
+    {
+        eprintln!("S3 upload failed for key {}: {e}", key);
+    }
 }
 
 async fn stream_logs(

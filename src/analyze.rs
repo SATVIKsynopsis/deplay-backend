@@ -8,7 +8,9 @@ pub struct AnalyzeResult {
     pub suggestions: Vec<String>,
 }
 
-pub async fn analyze(logs: &str) -> Result<AnalyzeResult, Box<dyn std::error::Error>> {
+pub async fn analyze(
+    logs: &str,
+) -> Result<AnalyzeResult, Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
 
     let prompt = format!(

@@ -50,5 +50,9 @@ pub async fn github_callback(Query(query): Query<GithubCallback>) -> Result<Resp
     let mut headers = HeaderMap::new();
     headers.insert(SET_COOKIE, cookie.to_string().parse().unwrap());
 
-    Ok((headers, Redirect::to("https://deplay-theta.vercel.app/dashboard")).into_response())
+    Ok((
+        headers,
+        Redirect::to("https://deplay-theta.vercel.app/dashboard"),
+    )
+        .into_response())
 }

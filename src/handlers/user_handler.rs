@@ -1,11 +1,12 @@
+use aws_sdk_dynamodb::types::AttributeValue;
+use axum::http::{header::SET_COOKIE, HeaderMap};
+use axum::response::Redirect;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Json},
 };
-use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::Cookie;
-use axum::http::{HeaderMap, header::SET_COOKIE};
-use axum::response::Redirect;
+use axum_extra::extract::CookieJar;
 use time::Duration;
 
 use crate::db;
@@ -101,4 +102,55 @@ pub async fn logout(jar: CookieJar) -> impl IntoResponse {
     headers.append(SET_COOKIE, gh_token.to_string().parse().unwrap());
 
     (headers, Redirect::to("https://deplay-theta.vercel.app")).into_response()
+}
+
+pub async fn get_runs(cookies: CookieJar) -> impl IntoResponse {
+    let github_id = match cookies.get("session") {
+        Some(c) => c.value().to_string(),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "Not logged in" })),
+            )
+        }
+    };
+
+    let pk = format!("USER#github_{}", github_id);
+    let client = db::dynamo_client().await;
+
+    let res = client
+        .query()
+        .table_name("Deplay")
+        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
+        .expression_attribute_values(":pk", AttributeValue::S(pk))
+        .expression_attribute_values(":prefix", AttributeValue::S("RUN#".to_string()))
+        .scan_index_forward(false)
+        .send()
+        .await;
+
+    match res {
+        Ok(output) => {
+            let items: Vec<serde_json::Value> = output.items().iter().map(|item| {
+    serde_json::json!({
+        "runId": item.get("runId").and_then(|v| v.as_s().ok()).map(|s| s.as_str()).unwrap_or(""),
+        "repoName": item.get("repoName").and_then(|v| v.as_s().ok()).map(|s| s.as_str()).unwrap_or(""),
+        "repoUrl": item.get("repoUrl").and_then(|v| v.as_s().ok()).map(|s| s.as_str()).unwrap_or(""),
+        "language": item.get("language").and_then(|v| v.as_s().ok()).map(|s| s.as_str()).unwrap_or(""),
+        "status": item.get("status").and_then(|v| v.as_s().ok()).map(|s| s.as_str()).unwrap_or(""),
+        "createdAt": item.get("createdAt").and_then(|v| v.as_s().ok()).map(|s| s.as_str()).unwrap_or(""),
+        "logsS3Key": item.get("logsS3Key").and_then(|v| v.as_s().ok()).map(|s| s.as_str()).unwrap_or(""),
+        "analysisS3Key": item.get("analysisS3Key").and_then(|v| v.as_s().ok()).map(|s| s.as_str()).unwrap_or(""),
+    })
+}).collect();
+
+            (StatusCode::OK, Json(serde_json::json!(items)))
+        }
+        Err(e) => {
+            eprintln!("DynamoDB query failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Failed to fetch runs" })),
+            )
+        }
+    }
 }

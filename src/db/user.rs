@@ -12,7 +12,7 @@ pub async fn save_user(client: &Client, github_id: i64, username: &str, access_t
         .item("pk", AttributeValue::S(pk))
         .item("sk", AttributeValue::S("PROFILE".to_string()))
         .item("provider", AttributeValue::S("github".to_string()))
-        .item("accessToken", AttributeValue::S(access_token.to_string())) 
+        .item("accessToken", AttributeValue::S(access_token.to_string()))
         .item("githubId", AttributeValue::N(github_id.to_string()))
         .item("username", AttributeValue::S(username.to_string()))
         .send()
@@ -20,7 +20,13 @@ pub async fn save_user(client: &Client, github_id: i64, username: &str, access_t
         .unwrap();
 }
 
-pub async fn upsert_user(client: &Client, github_id: i64, username: &str, avatar_url: &str, access_token: &str) {
+pub async fn upsert_user(
+    client: &Client,
+    github_id: i64,
+    username: &str,
+    avatar_url: &str,
+    access_token: &str,
+) {
     let now = chrono::Utc::now().to_rfc3339();
 
     let pk = format!("USER#github_{}", github_id);
@@ -63,5 +69,3 @@ pub async fn get_user(client: &Client, pk: &str) -> Result<serde_json::Value> {
         "accessToken": item["accessToken"].as_s().unwrap()
     }))
 }
-
-
