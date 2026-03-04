@@ -54,13 +54,17 @@ Logs:
         ]
     });
 
-    let response = client
+   let response = client
         .invoke_model()
         .model_id("anthropic.claude-3-5-haiku-20241022-v1:0")
         .content_type("application/json")
         .body(Blob::new(serde_json::to_vec(&body)?))
         .send()
-        .await?;
+        .await
+        .map_err(|e| {
+            eprintln!("Bedrock full error: {:?}", e);
+            e
+        })?;
 
     let response_body: serde_json::Value =
         serde_json::from_slice(response.body().as_ref())?;
