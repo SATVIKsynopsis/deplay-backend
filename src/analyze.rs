@@ -56,7 +56,7 @@ Logs:
 
    let response = client
         .invoke_model()
-        .model_id("anthropic.claude-3-5-haiku-20241022-v1:0")
+        .model_id("us.anthropic.claude-3-5-haiku-20241022-v1:0")
         .content_type("application/json")
         .body(Blob::new(serde_json::to_vec(&body)?))
         .send()
