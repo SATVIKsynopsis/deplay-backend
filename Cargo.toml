@@ -24,3 +24,4 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0.102"
 axum-extra = { version = "0.9.6", features = ["cookie"] }
 aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-bedrockruntime = { version = "1", features = ["behavior-version-latest"] }
