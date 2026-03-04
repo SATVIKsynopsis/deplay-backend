@@ -1,4 +1,5 @@
 use aws_sdk_bedrockruntime::primitives::Blob;
+use aws_config::Region;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -11,7 +12,10 @@ pub struct AnalyzeResult {
 pub async fn analyze(
     logs: &str,
 ) -> Result<AnalyzeResult, Box<dyn std::error::Error + Send + Sync>> {
-    let config = aws_config::load_from_env().await;
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(Region::new("us-east-1"))
+        .load()
+        .await;
     let client = aws_sdk_bedrockruntime::Client::new(&config);
 
     let prompt = format!(
