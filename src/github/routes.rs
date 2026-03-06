@@ -51,8 +51,8 @@ pub async fn github_callback(Query(query): Query<GithubCallback>) -> Result<Resp
     headers.insert(SET_COOKIE, cookie.to_string().parse().unwrap());
 
     Ok((
-        headers,
-        Redirect::to("https://deplay-theta.vercel.app"),
-    )
-        .into_response())
+    headers,
+    Redirect::to(&format!("{}/dashboard", std::env::var("APP_URL").unwrap())),
+)
+    .into_response())
 }
