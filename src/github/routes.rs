@@ -52,7 +52,7 @@ pub async fn github_callback(Query(query): Query<GithubCallback>) -> Result<Resp
 
     Ok((
         headers,
-        Redirect::to("https://deplay-theta.vercel.app/dashboard"),
+        Redirect::to("https://main.dsb7vt97yonc2.amplifyapp.com"),
     )
         .into_response())
 }
