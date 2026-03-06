@@ -101,7 +101,7 @@ pub async fn logout(jar: CookieJar) -> impl IntoResponse {
     headers.append(SET_COOKIE, session.to_string().parse().unwrap());
     headers.append(SET_COOKIE, gh_token.to_string().parse().unwrap());
 
-    (headers, Redirect::to("https://main.dsb7vt97yonc2.amplifyapp.com")).into_response()
+    (headers, Redirect::to("https://deplay-theta.vercel.app")).into_response()
 }
 
 pub async fn get_runs(cookies: CookieJar) -> impl IntoResponse {
