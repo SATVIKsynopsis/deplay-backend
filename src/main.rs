@@ -69,6 +69,7 @@ async fn main() {
         .route("/logout", get(user_handler::logout))
         .route("/repos", get(user_handler::get_repos))
         .route("/runs", get(user_handler::get_runs))
+        .route("/logs-static/:id", get(get_logs_static))
         .layer(cors);
 
     let port = std::env::var("PORT").unwrap_or("8080".to_string());
@@ -350,4 +351,12 @@ fn current_timestamp_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis()
+}
+
+async fn get_logs_static(Path(run_id): Path<String>) -> impl IntoResponse {
+    let path = format!("/tmp/deplik-{}.log", run_id);
+    match fs::read_to_string(path) {
+        Ok(content) => (StatusCode::OK, content),
+        Err(_) => (StatusCode::NOT_FOUND, "Logs not found".to_string()),
+    }
 }
