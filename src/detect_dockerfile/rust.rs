@@ -1,5 +1,5 @@
 pub const RUST_DOCKERFILE: &str = r#"
-FROM rust:1.75 AS builder
+FROM rust:latest AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release
