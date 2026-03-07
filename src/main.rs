@@ -55,6 +55,11 @@ async fn main() {
                 .parse::<HeaderValue>()
                 .unwrap(),
         )
+        .allow_origin(
+            "https://main.dsb7vt97yonc2.amplifyapp.com"
+                .parse::<HeaderValue>()
+                .unwrap(),
+        )
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([CONTENT_TYPE, AUTHORIZATION, ACCEPT])
         .allow_credentials(true);
