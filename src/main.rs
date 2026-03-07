@@ -60,6 +60,11 @@ async fn main() {
                 .parse::<HeaderValue>()
                 .unwrap(),
         )
+        .allow_origin(
+            "https://7hhu2l3cw4.execute-api.ap-south-1.amazonaws.com"
+                .parse::<HeaderValue>()
+                .unwrap(),
+        )
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([CONTENT_TYPE, AUTHORIZATION, ACCEPT])
         .allow_credentials(true);
